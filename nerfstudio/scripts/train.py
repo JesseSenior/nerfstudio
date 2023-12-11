@@ -136,7 +136,7 @@ def _distributed_worker(
     global_rank = machine_rank * num_devices_per_machine + local_rank
 
     dist.init_process_group(
-        backend="nccl" if device_type == "cuda" else "gloo",
+        # backend="nccl" if device_type == "cuda" else "gloo",
         init_method=dist_url,
         world_size=world_size,
         rank=global_rank,

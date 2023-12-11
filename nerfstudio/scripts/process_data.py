@@ -17,12 +17,16 @@
 
 
 import sys
+import shutil
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from tqdm import tqdm
 from typing import Union
 
 import numpy as np
+import cv2
+import torch
 import tyro
 from typing_extensions import Annotated
 
@@ -475,6 +479,69 @@ class ProcessODM(BaseConverterToNerfstudioDataset):
         CONSOLE.rule()
 
 
+@dataclass
+class ProcessQuad6K:
+    """Process class to process Quad 6k dataset into a Mega-NeRF dataset.
+
+    Please refer: https://github.com/cmusatyalab/mega-nerf#quad-6k-dataset
+    """
+
+    image_dir: Path
+    """Path to the images."""
+    pose_dir: Path
+    """Path to the camera poses."""
+    output_dir: Path
+    """Path to the output directory."""
+
+    @staticmethod
+    def refresh_dir(dir_path: Path):
+        if dir_path.is_dir():
+            shutil.rmtree(dir_path)
+        dir_path.mkdir(parents=True)
+
+    @staticmethod
+    def process_image(image_path: Path, metadata_path: Path, output_dir: Path):
+        distorted = cv2.imread(str(image_path))
+        metadata = torch.load(metadata_path, map_location="cpu")
+        intrinsics = metadata["intrinsics"]
+        camera_matrix = np.array([[intrinsics[0], 0, intrinsics[2]], [0, intrinsics[1], intrinsics[3]], [0, 0, 1]])
+
+        undistorted = cv2.undistort(distorted, camera_matrix, metadata["distortion"].numpy())
+        assert undistorted.shape[0] == metadata["H"]
+        assert undistorted.shape[1] == metadata["W"]
+
+        target_image_path = (
+            output_dir / metadata_path.parent.parent.name / "rgbs" / (metadata_path.stem + image_path.suffix)
+        )
+        target_metadata_path = output_dir / metadata_path.parent.parent.name / "metadata" / metadata_path.name
+
+        cv2.imwrite(str(target_image_path), undistorted)
+        if not target_metadata_path.is_file():
+            shutil.copy2(metadata_path, target_metadata_path)
+
+    def __post_init__(self) -> None:
+        ProcessQuad6K.refresh_dir(self.output_dir / "train" / "rgbs")
+        (self.output_dir / "train" / "metadata").mkdir(parents=True, exist_ok=True)
+        ProcessQuad6K.refresh_dir(self.output_dir / "val" / "rgbs")
+        (self.output_dir / "val" / "metadata").mkdir(parents=True, exist_ok=True)
+
+    def main(self) -> None:
+        """Process class to process Quad 6k Dataset into a Mega-NeRF dataset."""
+        tasks = list()
+        with (self.pose_dir / "mappings.txt").open() as f:
+            lines = f.readlines()
+            for line in lines:
+                image_name, metadata_name = line.strip().split(",")
+                metadata_path = self.pose_dir / "train" / "metadata" / metadata_name
+                if not metadata_path.exists():
+                    metadata_path = self.pose_dir / "val" / "metadata" / metadata_name
+                    assert metadata_path.exists()
+                tasks.append((self.image_dir / image_name, metadata_path, self.output_dir))
+
+        for task in tqdm(tasks, desc="Process images"):
+            ProcessQuad6K.process_image(*task)
+
+
 Commands = Union[
     Annotated[ImagesToNerfstudioDataset, tyro.conf.subcommand(name="images")],
     Annotated[VideoToNerfstudioDataset, tyro.conf.subcommand(name="video")],
@@ -482,6 +549,7 @@ Commands = Union[
     Annotated[ProcessMetashape, tyro.conf.subcommand(name="metashape")],
     Annotated[ProcessRealityCapture, tyro.conf.subcommand(name="realitycapture")],
     Annotated[ProcessRecord3D, tyro.conf.subcommand(name="record3d")],
+    Annotated[ProcessQuad6K, tyro.conf.subcommand(name="quad6k")],
     Annotated[ProcessODM, tyro.conf.subcommand(name="odm")],
 ]
 

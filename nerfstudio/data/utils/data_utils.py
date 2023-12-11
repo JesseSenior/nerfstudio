@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """Utility functions to allow easy re-use of common operations across dataloaders"""
+import sys
 from pathlib import Path
 from typing import List, Tuple, Union
 
@@ -20,6 +21,21 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
+
+
+def getsizeof_dict(obj) -> int:
+    """
+    Utility function to recursively get size of a dict which may contains tensors.
+    """
+    if isinstance(obj, dict):
+        total: int = 0
+        for key in obj.keys():
+            total += getsizeof_dict(obj[key])
+        return total
+    elif isinstance(obj, torch.Tensor):
+        return sys.getsizeof(obj.untyped_storage())
+    else:
+        return sys.getsizeof(obj)
 
 
 def get_image_mask_tensor_from_path(filepath: Path, scale_factor: float = 1.0) -> torch.Tensor:

@@ -20,6 +20,8 @@ from __future__ import annotations
 import concurrent.futures
 import queue
 import time
+import random
+from threading import Thread
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
@@ -27,14 +29,17 @@ from typing import (
     Generic,
     List,
     Literal,
+    Callable,
     Optional,
     Tuple,
+    Any,
     Type,
     Union,
 )
 
 import torch
 import torch.multiprocessing as mp
+import psutil
 from rich.progress import track
 from torch.nn import Parameter
 
@@ -57,8 +62,11 @@ from nerfstudio.data.utils.dataloaders import (
     FixedIndicesEvalDataloader,
     RandIndicesEvalDataloader,
 )
+from nerfstudio.data.utils.data_utils import getsizeof_dict
+from nerfstudio.data.utils.nerfstudio_collate import nerfstudio_collate
 from nerfstudio.model_components.ray_generators import RayGenerator
 from nerfstudio.utils.rich_utils import CONSOLE
+from nerfstudio.utils.comms import get_local_size
 
 
 @dataclass
@@ -92,25 +100,73 @@ class DataProcessor(mp.Process):
 
     def __init__(
         self,
-        out_queue: mp.Queue,
-        config: ParallelDataManagerConfig,
-        dataparser_outputs: DataparserOutputs,
         dataset: TDataset,
+        out_queue: mp.Queue,
         pixel_sampler: PixelSampler,
+        num_images_to_sample_from: int = -1,
+        num_times_to_repeat_images: int = -1,
+        collate_fn: Callable[[Any], Any] = nerfstudio_collate,
     ):
         super().__init__()
         self.daemon = True
         self.out_queue = out_queue
-        self.config = config
-        self.dataparser_outputs = dataparser_outputs
         self.dataset = dataset
-        self.exclude_batch_keys_from_device = self.dataset.exclude_batch_keys_from_device
         self.pixel_sampler = pixel_sampler
-        self.ray_generator = RayGenerator(self.dataset.cameras)
+        self.collate_fn = collate_fn
+        self.num_images_to_sample_from = num_images_to_sample_from
+        self.num_times_to_repeat_images = num_times_to_repeat_images
+        self.cache_all_images = False
+
+        if self.num_images_to_sample_from == -1:
+            CONSOLE.print("num_images_to_sample_from == -1, evaluate it from dataset size.")
+            mem = psutil.virtual_memory()
+            dataset_elem_size = getsizeof_dict(self.dataset[0])
+            dataset_size = dataset_elem_size * len(dataset)
+            CONSOLE.print(f" - Dataset size: {len(dataset)}")
+            CONSOLE.print(f" - Dataset element size: {dataset_elem_size/1024**2:.3f} MiB")
+            CONSOLE.print(f" - Dataset total size: {dataset_size/1024**3:.3f} GiB")
+            CONSOLE.print(f" - Available memory: {mem.available/1024**3:.3f} GiB")
+            if self.collate_fn == variable_res_collate:
+                CONSOLE.print(
+                    "[bold yellow]Warning: variable_res_collate detected, the dataset size estimation may be incorrect."
+                )
+            if dataset_size * 5 * get_local_size() > mem.available:
+                self.num_images_to_sample_from = int(mem.available / 10 / dataset_elem_size / get_local_size())
+                if self.num_times_to_repeat_images == -1:
+                    CONSOLE.print(
+                        f"Caching {self.num_images_to_sample_from} out of {len(self.dataset)} images, "
+                        f"resampling at once when cache_images() ends."
+                    )
+                else:
+                    CONSOLE.print(
+                        f"Caching {self.num_images_to_sample_from} out of {len(self.dataset)} images, "
+                        f"resampling every {self.num_times_to_repeat_images} iters."
+                    )
+            else:
+                CONSOLE.print(f"Caching all {len(dataset)} images.")
+                self.cache_all_images = True
+        elif self.num_times_to_repeat_images == -1:
+            CONSOLE.print(
+                f"Caching {self.num_images_to_sample_from} out of {len(self.dataset)} images, "
+                f"resampling at once when cache_images() ends."
+            )
+        else:
+            CONSOLE.print(
+                f"Caching {self.num_images_to_sample_from} out of {len(self.dataset)} images, "
+                f"resampling every {self.num_times_to_repeat_images} iters."
+            )
         self.cache_images()
+
+        self.ray_generator = RayGenerator(self.dataset.cameras)
+        self.img_data = self.next_img_data
+        del self.next_img_data
 
     def run(self):
         """Append out queue in parallel with ray bundles and batches."""
+        count = 0
+        if not self.cache_all_images:
+            self.cache_images_thread = Thread(target=self.cache_images)
+            self.cache_images_thread.start()
         while True:
             batch = self.pixel_sampler.sample(self.img_data)
             ray_indices = batch["indices"]
@@ -127,19 +183,43 @@ class DataProcessor(mp.Process):
                 except Exception:
                     CONSOLE.print_exception()
                     CONSOLE.print("[bold red]Error: Error occured in parallel datamanager queue.")
+            if not self.cache_all_images:
+                repeat_image = False
+                if self.num_times_to_repeat_images != -1:
+                    count += 1
+                    repeat_image = count == self.num_times_to_repeat_images
+                else:
+                    repeat_image = not self.cache_images_thread.is_alive()
+                if repeat_image:
+                    del self.img_data
+                    self.cache_images_thread.join(timeout=60)
+                    if self.cache_images_thread.is_alive():
+                        raise TimeoutError("Cache images thread timeout! Please increase num_times_to_repeat_images.")
+
+                    self.img_data = self.next_img_data
+                    del self.next_img_data, self.cache_images_thread
+                    count = 0
+
+                    self.cache_images_thread = Thread(target=self.cache_images)
+                    self.cache_images_thread.start()
 
     def cache_images(self):
         """Caches all input images into a NxHxWx3 tensor."""
-        indices = range(len(self.dataset))
+        indices = (
+            random.sample(range(len(self.dataset)), k=self.num_images_to_sample_from)
+            if not self.cache_all_images
+            else range(len(self.dataset))
+        )
         batch_list = []
         results = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.max_thread_workers) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:  # type: ignore
             for idx in indices:
                 res = executor.submit(self.dataset.__getitem__, idx)
                 results.append(res)
-            for res in track(results, description="Loading data batch", transient=False):
+            for res in track(results, description="Loading data batch", transient=True):
                 batch_list.append(res.result())
-        self.img_data = self.config.collate_fn(batch_list)
+        self.next_img_data = self.collate_fn(batch_list)
+        del batch_list, results, indices
 
 
 class ParallelDataManager(DataManager, Generic[TDataset]):
@@ -226,13 +306,14 @@ class ParallelDataManager(DataManager, Generic[TDataset]):
         self.data_queue = mp.Manager().Queue(maxsize=self.config.queue_size)
         self.data_procs = [
             DataProcessor(
-                out_queue=self.data_queue,  # type: ignore
-                config=self.config,
-                dataparser_outputs=self.train_dataparser_outputs,
                 dataset=self.train_dataset,
+                out_queue=self.data_queue,  # type: ignore
                 pixel_sampler=self.train_pixel_sampler,
+                num_images_to_sample_from=self.config.train_num_images_to_sample_from,
+                num_times_to_repeat_images=self.config.train_num_times_to_repeat_images,
+                collate_fn=self.config.collate_fn,
             )
-            for i in range(self.config.num_processes)
+            for _ in range(self.config.num_processes)
         ]
         for proc in self.data_procs:
             proc.start()

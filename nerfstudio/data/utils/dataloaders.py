@@ -24,6 +24,7 @@ from abc import abstractmethod
 from typing import Any, Callable, Dict, List, Optional, Sized, Tuple, Union
 
 import torch
+import psutil
 from rich.progress import track
 from torch.utils.data import Dataset
 from torch.utils.data.dataloader import DataLoader
@@ -31,7 +32,9 @@ from torch.utils.data.dataloader import DataLoader
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.data.datasets.base_dataset import InputDataset
+from nerfstudio.data.utils.data_utils import getsizeof_dict
 from nerfstudio.data.utils.nerfstudio_collate import nerfstudio_collate
+from nerfstudio.utils.comms import get_local_size
 from nerfstudio.utils.misc import get_dict_to_torch
 from nerfstudio.utils.rich_utils import CONSOLE
 
@@ -65,8 +68,7 @@ class CacheDataloader(DataLoader):
 
         super().__init__(dataset=dataset, **kwargs)  # This will set self.dataset
         self.num_times_to_repeat_images = num_times_to_repeat_images
-        self.cache_all_images = (num_images_to_sample_from == -1) or (num_images_to_sample_from >= len(self.dataset))
-        self.num_images_to_sample_from = len(self.dataset) if self.cache_all_images else num_images_to_sample_from
+        self.num_images_to_sample_from = num_images_to_sample_from
         self.device = device
         self.collate_fn = collate_fn
         self.num_workers = kwargs.get("num_workers", 0)
@@ -76,13 +78,33 @@ class CacheDataloader(DataLoader):
         self.first_time = True
 
         self.cached_collated_batch = None
-        if self.cache_all_images:
-            CONSOLE.print(f"Caching all {len(self.dataset)} images.")
-            if len(self.dataset) > 500:
-                CONSOLE.print(
-                    "[bold yellow]Warning: If you run out of memory, try reducing the number of images to sample from."
-                )
-            self.cached_collated_batch = self._get_collated_batch()
+        self.cache_all_images = False
+        if self.num_images_to_sample_from == -1:
+            CONSOLE.print("num_images_to_sample_from == -1, evaluate it from dataset size.")
+            mem = psutil.virtual_memory()
+            dataset_elem_size = getsizeof_dict(self.dataset[0])
+            dataset_size = dataset_elem_size * len(self.dataset)
+            CONSOLE.print(f" - Dataset size: {len(self.dataset)}")
+            CONSOLE.print(f" - Dataset element size: {dataset_elem_size/1024**2:.3f} MiB")
+            CONSOLE.print(f" - Dataset total size: {dataset_size/1024**3:.3f} GiB")
+            CONSOLE.print(f" - Available memory: {mem.available/1024**3:.3f} GiB")
+            if dataset_size * 5 * get_local_size() > mem.available:
+                self.num_images_to_sample_from = int(mem.available / 8 / dataset_elem_size / get_local_size())  # type: ignore
+                if self.num_times_to_repeat_images == -1:
+                    CONSOLE.print(
+                        f"Caching {self.num_images_to_sample_from} out of {len(self.dataset)} images, "
+                        f"resampling at once when cache_images() ends."
+                    )
+                else:
+                    CONSOLE.print(
+                        f"Caching {self.num_images_to_sample_from} out of {len(self.dataset)} images, "
+                        f"resampling every {self.num_times_to_repeat_images} iters."
+                    )
+            else:
+                CONSOLE.print(f"Caching all {len(self.dataset)} images.")
+                self.cache_all_images = True
+                self.num_images_to_sample_from = len(self.dataset)
+                self.cached_collated_batch = self._get_collated_batch()
         elif self.num_times_to_repeat_images == -1:
             CONSOLE.print(
                 f"Caching {self.num_images_to_sample_from} out of {len(self.dataset)} images, without resampling."
@@ -136,6 +158,7 @@ class CacheDataloader(DataLoader):
             ):
                 # trigger a reset
                 self.num_repeated = 0
+                del self.cached_collated_batch
                 collated_batch = self._get_collated_batch()
                 # possibly save a cached item
                 self.cached_collated_batch = collated_batch if self.num_times_to_repeat_images != 0 else None
